@@ -136,14 +136,14 @@ namespace GLTFast {
         AccessorUsage[] accessorUsage;
         JobHandle accessorJobsHandle;
         PrimitiveCreateContextBase[] primitiveContexts;
-        Dictionary<Attributes,VertexBufferConfigBase> vertexAttributes;
+        Dictionary<MeshPrimitive,VertexBufferConfigBase> vertexAttributes;
         /// <summary>
         /// Array of dictionaries, indexed by mesh ID
         /// The dictionary contains all the mesh's primitives, clustered
         /// by Vertex Attribute usage (Primitives with identical vertex
         /// data will be clustered).
         /// </summary>
-        Dictionary<Attributes,List<MeshPrimitive>>[] meshPrimitiveCluster;
+        Dictionary<MeshPrimitive,List<MeshPrimitive>>[] meshPrimitiveCluster;
         List<ImageCreateContext> imageCreateContexts;
 #if KTX_UNITY
         List<KtxLoadContextBase> ktxLoadContextsBuffer;
@@ -1791,8 +1791,8 @@ namespace GLTFast {
 
             Profiler.BeginSample("LoadAccessorData.Init");
 
-            var mainBufferTypes = new Dictionary<Attributes,MainBufferType>();
-            meshPrimitiveCluster = new Dictionary<Attributes,List<MeshPrimitive>>[gltf.meshes.Length];
+            var mainBufferTypes = new Dictionary<MeshPrimitive,MainBufferType>();
+            meshPrimitiveCluster = new Dictionary<MeshPrimitive,List<MeshPrimitive>>[gltf.meshes.Length];
 #if DEBUG
             var perAttributeMeshCollection = new Dictionary<Attributes,HashSet<int>>();
 #endif
@@ -1804,14 +1804,14 @@ namespace GLTFast {
             {
                 var mesh = gltf.meshes[meshIndex];
                 meshPrimitiveIndex[meshIndex] = totalPrimitives;
-                var cluster = new Dictionary<Attributes, List<MeshPrimitive>>();
+                var cluster = new Dictionary<MeshPrimitive, List<MeshPrimitive>>();
                 
                 foreach(var primitive in mesh.primitives) {
                     
-                    if(!cluster.ContainsKey(primitive.attributes)) {
-                        cluster[primitive.attributes] = new List<MeshPrimitive>();
+                    if(!cluster.ContainsKey(primitive)) {
+                        cluster[primitive] = new List<MeshPrimitive>();
                     }
-                    cluster[primitive.attributes].Add(primitive);
+                    cluster[primitive].Add(primitive);
 #if DRACO_UNITY
                     var isDraco = primitive.isDracoCompressed;
                     if(isDraco) continue;
@@ -1830,7 +1830,7 @@ namespace GLTFast {
                         SetAccessorUsage(primitive.indices, isDraco ? AccessorUsage.Ignore : usage );
                     }
 
-                    if(!mainBufferTypes.TryGetValue(att,out var mainBufferType)) {
+                    if(!mainBufferTypes.TryGetValue(primitive,out var mainBufferType)) {
                         if(att.TANGENT>=0) {
                             mainBufferType = MainBufferType.PosNormTan;
                         } else
@@ -1850,7 +1850,7 @@ namespace GLTFast {
                             mainBufferType |= MainBufferType.Tangent;
                         }
                     }
-                    mainBufferTypes[primitive.attributes] = mainBufferType;
+                    mainBufferTypes[primitive] = mainBufferType;
                     
 #if DEBUG
                     if(!perAttributeMeshCollection.TryGetValue(att, out var attributeMesh)) {
@@ -1890,8 +1890,8 @@ namespace GLTFast {
             primitives = new Primitive[totalPrimitives];
             primitiveContexts = new PrimitiveCreateContextBase[totalPrimitives];
             var tmpList = new List<JobHandle>(mainBufferTypes.Count);
-            vertexAttributes = new Dictionary<Attributes,VertexBufferConfigBase>(mainBufferTypes.Count);
-
+            vertexAttributes = new Dictionary<MeshPrimitive,VertexBufferConfigBase>(mainBufferTypes.Count);
+            Dictionary<MeshPrimitive,MorphTargetsContext> morphTargetsContexts = null;
 #if DEBUG
             foreach (var perAttributeMeshes in perAttributeMeshCollection) {
                 if(perAttributeMeshes.Value.Count>1) {
@@ -1908,7 +1908,8 @@ namespace GLTFast {
 
                 Profiler.BeginSample("LoadAccessorData.ScheduleVertexJob");
 
-                var att = mainBufferType.Key;
+                var primitive = mainBufferType.Key;
+                var att = primitive.attributes;
 
                 var posInput = GetAccessorParams(gltf,att.POSITION);
                 bool hasNormals = att.NORMAL >= 0;
@@ -1963,7 +1964,7 @@ namespace GLTFast {
                 }
                 config.calculateNormals = !hasNormals && (mainBufferType.Value & MainBufferType.Normal) > 0;
                 config.calculateTangents = !hasTangents && (mainBufferType.Value & MainBufferType.Tangent) > 0;
-                vertexAttributes[att] = config;
+                vertexAttributes[primitive] = config;
                 
                 var jh = config.ScheduleVertexJobs(
                     posInput,
@@ -1983,6 +1984,31 @@ namespace GLTFast {
                 }
 
                 Profiler.EndSample();
+
+                if (success && primitive.targets != null) {
+                    if (morphTargetsContexts == null) {
+                        morphTargetsContexts = new Dictionary<MeshPrimitive, MorphTargetsContext>();
+                    } else if (morphTargetsContexts.ContainsKey(primitive)) {
+                        continue;
+                    }
+                    var morphTargetsContext = new MorphTargetsContext(primitive.targets.Length);
+                    foreach (var morphTarget in primitive.targets) {
+                        success = morphTargetsContext.AddMorphTarget(
+                            GetAccessorParams(gltf,morphTarget.POSITION),
+                            morphTarget.NORMAL>=0 ? GetAccessorParams(gltf,morphTarget.NORMAL) : (VertexInputData?)null,
+                            morphTarget.TANGENT>=0 ? GetAccessorParams(gltf,morphTarget.TANGENT) : (VertexInputData?)null
+                            );
+                        if (!success) {
+                            // TODO: error reporting
+                            break;
+                        }
+                    }
+                    if (success) {
+                        var jobHandle = morphTargetsContext.GetJobHandle();
+                        tmpList.Add(jobHandle);
+                        morphTargetsContexts[primitive] = morphTargetsContext;
+                    }
+                }
                 
                 await deferAgent.BreakPoint();
             }
@@ -2129,6 +2155,11 @@ namespace GLTFast {
                             // PreparePrimitiveIndices(gltf,mesh,primitive,ref c,primIndex);
                             context = c;
                         }
+
+                        if (primitive.targets != null) {
+                            context.morphTargetsContext = morphTargetsContexts[primitive];
+                        }
+                        
                         context.primtiveIndex = primitiveIndex;
                         context.materials[primIndex] = primitive.material;
 
